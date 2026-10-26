@@ -34,6 +34,19 @@ function parseEnabledEnvFlag(value: string | undefined): boolean | undefined {
  */
 export type ModelScopedCapacityRoutingMode = "off" | "exhausted";
 
+/**
+ * Which client sends auto-refresh probes for Anthropic OAuth accounts.
+ * "claude-cli" runs the real `claude -p` against the proxy (see
+ * auto-refresh-claude-cli.ts); "synthetic" builds the request in-process;
+ * "auto" (default) uses the CLI when it can be found and the synthetic probe
+ * otherwise.
+ */
+export type AutoRefreshClient = "auto" | "synthetic" | "claude-cli";
+
+function isValidAutoRefreshClient(value: unknown): value is AutoRefreshClient {
+	return value === "auto" || value === "synthetic" || value === "claude-cli";
+}
+
 function isValidModelScopedCapacityRoutingMode(
 	value: unknown,
 ): value is ModelScopedCapacityRoutingMode {
@@ -125,6 +138,8 @@ export interface ConfigData {
 	auto_vacuum_enabled?: boolean;
 	usage_poll_interval_ms?: number;
 	cache_keepalive_ttl_minutes?: number;
+	auto_refresh_client?: AutoRefreshClient;
+	auto_refresh_claude_path?: string;
 	system_prompt_cache_ttl_1h?: boolean;
 	usage_throttling_five_hour_enabled?: boolean;
 	usage_throttling_weekly_enabled?: boolean;
@@ -595,6 +610,23 @@ export class Config extends EventEmitter {
 	setCacheKeepaliveTtlMinutes(minutes: number): void {
 		const clamped = this.clamp(minutes, 0, 60);
 		this.set("cache_keepalive_ttl_minutes", clamped);
+	}
+
+	getAutoRefreshClient(): AutoRefreshClient {
+		const fromEnv = process.env.CCFLARE_AUTO_REFRESH_CLIENT?.trim();
+		if (isValidAutoRefreshClient(fromEnv)) return fromEnv;
+		const fromFile = this.data.auto_refresh_client;
+		if (isValidAutoRefreshClient(fromFile)) return fromFile;
+		return "auto";
+	}
+
+	/** Executable for the "claude-cli" and "auto" clients: a name on PATH or a path. */
+	getAutoRefreshClaudePath(): string {
+		const fromEnv = process.env.CCFLARE_AUTO_REFRESH_CLAUDE_PATH?.trim();
+		if (fromEnv) return fromEnv;
+		const fromFile = this.data.auto_refresh_claude_path?.trim();
+		if (fromFile) return fromFile;
+		return "claude";
 	}
 
 	/**
@@ -1276,6 +1308,7 @@ export class Config extends EventEmitter {
 			auto_vacuum_enabled: this.getAutoVacuumEnabled(),
 			usage_poll_interval_ms: this.getUsagePollIntervalMs(),
 			cache_keepalive_ttl_minutes: this.getCacheKeepaliveTtlMinutes(),
+			auto_refresh_client: this.getAutoRefreshClient(),
 			system_prompt_cache_ttl_1h: this.getSystemPromptCacheTtl1h(),
 			usage_throttling_five_hour_enabled:
 				this.getUsageThrottlingFiveHourEnabled(),

@@ -211,6 +211,92 @@ endpoint (see `docs/providers.md`, CodexProvider feature 8), the refresh button
 only falls back to the `"."` ping when that endpoint returns nothing — an
 account on a custom endpoint, or a 403.
 
+### Sending Probes Through the Real Claude Code CLI (Anthropic)
+
+The disguise above has one part that cannot hold over time: the CLI identity is
+copied by hand, so it carries the values that were current when it was copied
+(`x-stainless-package-version`, the Node runtime version, the `anthropic-beta`
+set, the probe models) while the real Claude Code moves on every release.
+
+So for Anthropic OAuth accounts the probe is sent by the real CLI whenever it
+is installed. `CCFLARE_AUTO_REFRESH_CLIENT` (or `auto_refresh_client` in the
+config file) chooses:
+
+- `auto` (default): the CLI if `CCFLARE_AUTO_REFRESH_CLAUDE_PATH` (default
+  `claude`) names an executable, checked on every probe, so installing Claude
+  Code is enough to switch. Otherwise, the Docker image included, the synthetic
+  probe as before.
+- `claude-cli`: always the CLI.
+- `synthetic`: always the synthetic probe.
+
+```bash
+CCFLARE_AUTO_REFRESH_CLIENT=claude-cli
+# optional, defaults to `claude` on PATH
+CCFLARE_AUTO_REFRESH_CLAUDE_PATH=/usr/local/bin/claude
+```
+
+The scheduler then runs `claude -p "<prompt from the pool>" --model haiku`
+against the proxy, so the request on the wire is whatever the installed Claude
+Code produces — current by construction. Everything else is unchanged: the
+prompt still comes from the pool and its 24-hour lock, the request still goes
+through the proxy to the forced account, and the scheduler reads the proxy's
+answer (status, rate-limit headers, body) exactly as it does for the synthetic
+probe.
+
+How the run is isolated:
+
+- **A loopback relay sits between the CLI and the proxy.** It adds the internal
+  routing headers and the probe secret on the way in and records the proxy's
+  answer for the scheduler, so the secret never enters the CLI's environment or
+  argv. It serves only the CLI it started: anything else on the machine that
+  finds its port gets a 401.
+- **The environment is built from scratch**: `PATH`, a fresh temporary `HOME`
+  and `CLAUDE_CONFIG_DIR` (removed after the run), `ANTHROPIC_BASE_URL` (the
+  relay), a per-run relay token as `ANTHROPIC_AUTH_TOKEN`,
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `CLAUDE_CODE_MAX_RETRIES=0`,
+  `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` and
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. Nothing from the server's
+  environment, nor the operator's own Claude Code login, settings, plugins or
+  MCP servers, reaches it. Auto-memory is off because it writes the config
+  dir's path into the prompt, and a temporary path can still name the operator.
+- **It runs in `/`.** Claude Code describes its working directory to the model
+  and loads `CLAUDE.md` files, skills and agents from every directory above it;
+  under a shared temporary directory any local user could plant those. The
+  filesystem root has no parent and only root can write to it.
+- **One probe, one request.** The relay forwards the CLI's first Messages
+  request and refuses anything after it, so the CLI's own follow-ups (another
+  try after a 404, continuing a reply cut at `max_tokens`) never spend quota.
+  CLI retries and its non-streaming retry of a failed stream are off too; the
+  scheduler keeps deciding what a failure means and when to try again.
+- **No tool ever runs.** The run is limited to one turn (`--max-turns 1`), so a
+  reply asking for a tool ends it instead of letting the CLI read local files
+  and send them on. The tool definitions are still sent, as in any Claude Code
+  request.
+- **The answer decides, not the CLI.** A 2xx is a refresh only if its stream
+  reached `message_stop` without an `error` event, whatever the CLI's exit
+  status (it stops non-zero at a tool call or a refused follow-up). A 2xx whose
+  stream failed after the status line (an `overloaded_error` event, a dropped
+  connection) gets the uncounted-failure cooldown instead.
+
+If the CLI cannot be started, or exits before sending anything (a version too
+old for the flags above, a broken install), nothing was spoken, and what
+happens depends on the setting. Under `auto` the synthetic probe is sent
+instead, with a warning in the log. Under `claude-cli` the prompt is handed
+back, the account is held off for the usual uncounted-failure cooldown, and
+**no synthetic probe is sent in its place**: falling back would defeat the
+point of choosing the CLI. A run that does not finish within 120 seconds,
+reading the proxy's answer included, is killed (with anything it started) and
+its requests aborted. The Docker image does not ship the `claude` binary, so
+there `auto` means the synthetic probe until Claude Code is installed in the
+container or a custom image.
+
+**Cost:** a real CLI run sends Claude Code's full system prompt and tool
+definitions, roughly 12k input tokens on Haiku per probe (Claude Code 2.1.310)
+instead of a few dozen, and its reply is not capped at `max_tokens: 10`. With
+one probe per 5-hour window that is a few probes a day per account.
+
+Codex and Z.ai accounts keep the synthetic probe in every mode.
+
 ## Setting Up Auto-Refresh
 
 ### Prerequisites

@@ -19,6 +19,10 @@ import {
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import {
+	resolveAutoRefreshClient,
+	sendAutoRefreshViaClaudeCli,
+} from "./auto-refresh-claude-cli";
+import {
 	AUTO_REFRESH_PROMPTS,
 	claimAutoRefreshPrompt,
 	releaseAutoRefreshPrompt,
@@ -582,6 +586,22 @@ export class AutoRefreshScheduler {
 					: "http";
 			const endpoint = `${protocol}://localhost:${proxyPort}/v1/messages`;
 
+			const internalHeaders: Record<string, string> = {
+				// CRITICAL: Force the proxy to use this specific account
+				"x-better-ccflare-account-id": account.id,
+				// CRITICAL: Bypass session tracking for auto-refresh messages
+				"x-better-ccflare-bypass-session": "true",
+				// Tag the request as a synthetic auto-refresh probe so downstream
+				// pipeline layers can distinguish it from real user traffic
+				// (cache-body-store skips staging for these, request logging
+				// and pool-exhausted 503 metrics filter them out — issue #199,
+				// bug 2). Mirrors the existing x-better-ccflare-keepalive
+				// pattern used by cache-keepalive-scheduler.ts.
+				"x-better-ccflare-auto-refresh": "true",
+				[INTERNAL_PROBE_SECRET_HEADER]:
+					this.proxyContext.internalProbeSecret ?? "",
+			};
+
 			// Use same headers as normal Claude Code CLI requests, plus the special account ID header
 			const headers = new Headers({
 				accept: "application/json",
@@ -604,19 +624,7 @@ export class AutoRefreshScheduler {
 				"x-stainless-runtime": "node",
 				"x-stainless-runtime-version": "v24.9.0",
 				"x-stainless-timeout": "600",
-				// CRITICAL: Force the proxy to use this specific account
-				"x-better-ccflare-account-id": account.id,
-				// CRITICAL: Bypass session tracking for auto-refresh messages
-				"x-better-ccflare-bypass-session": "true",
-				// Tag the request as a synthetic auto-refresh probe so downstream
-				// pipeline layers can distinguish it from real user traffic
-				// (cache-body-store skips staging for these, request logging
-				// and pool-exhausted 503 metrics filter them out — issue #199,
-				// bug 2). Mirrors the existing x-better-ccflare-keepalive
-				// pattern used by cache-keepalive-scheduler.ts.
-				"x-better-ccflare-auto-refresh": "true",
-				[INTERNAL_PROBE_SECRET_HEADER]:
-					this.proxyContext.internalProbeSecret ?? "",
+				...internalHeaders,
 			});
 
 			// Try sending with multiple models if needed
@@ -629,62 +637,126 @@ export class AutoRefreshScheduler {
 				CLAUDE_MODEL_IDS.SONNET_4,
 			];
 
-			for (const model of models) {
-				try {
-					modelToTry = model; // Update the model being tried
-					log.info(
-						`Attempting auto-refresh for ${accountRow.name} with model: ${modelToTry} to endpoint: ${endpoint}`,
-					);
+			// Without a config (tests) the synthetic probe, as before the CLI
+			// client existed.
+			const configured =
+				this.proxyContext.config?.getAutoRefreshClient() ?? "synthetic";
+			const claudePath =
+				configured === "synthetic"
+					? ""
+					: this.proxyContext.config.getAutoRefreshClaudePath();
+			const useClaudeCli =
+				accountRow.provider === "anthropic" &&
+				resolveAutoRefreshClient(configured, claudePath) === "claude-cli";
 
-					const requestBody = {
-						model: modelToTry,
-						max_tokens: 10,
-						messages: [
-							{
-								role: "user",
-								content: claim.prompt,
-							},
-						],
-					};
-
-					log.debug(
-						`Auto-refresh request payload: ${JSON.stringify(requestBody, null, 2)}`,
+			let sentViaCli = false;
+			if (useClaudeCli) {
+				log.info(
+					`Attempting auto-refresh for ${accountRow.name} with the Claude Code CLI (${claudePath})`,
+				);
+				const result = await sendAutoRefreshViaClaudeCli({
+					claudePath,
+					prompt: claim.prompt,
+					proxyOrigin: `${protocol}://localhost:${proxyPort}`,
+					internalHeaders,
+				});
+				if (!result.sent && configured === "claude-cli") {
+					// The CLI never reached the proxy, so the prompt was never
+					// spoken. The operator chose the CLI over the synthetic probe,
+					// so falling back would defeat the point; hold the account off.
+					log.error(
+						`Claude Code CLI auto-refresh for ${accountRow.name} sent nothing: ${result.error ?? "no request reached the proxy"}`,
 					);
-					log.debug(
-						`Auto-refresh headers: ${JSON.stringify(Object.fromEntries(headers.entries()), null, 2)}`,
+					releaseAutoRefreshPrompt(claim.index);
+					this.recordUncountedProbeFailure(accountRow.id, accountRow.name);
+					return false;
+				}
+				if (!result.sent) {
+					// "auto" found a CLI that cannot send (too old for the flags
+					// it is given, broken install). Nothing was spoken, so the
+					// synthetic probe can still refresh the account.
+					log.warn(
+						`Claude Code CLI auto-refresh for ${accountRow.name} sent nothing (${result.error ?? "no request reached the proxy"}); falling back to the synthetic probe. Set CCFLARE_AUTO_REFRESH_CLIENT to choose one explicitly.`,
 					);
-
-					// Past this line the text may already be on the wire, so the
-					// prompt stays claimed however the request ends.
+				} else {
+					sentViaCli = true;
 					probeSent = true;
-					response = await fetch(endpoint, {
-						method: "POST",
-						headers,
-						body: JSON.stringify(requestBody),
-						signal: AbortSignal.timeout(30000),
-					});
-
-					log.debug(
-						`Auto-refresh response status: ${response.status} ${response.statusText}`,
-					);
-
-					// If we get a successful response, break out of the loop
-					if (response.ok || response.status !== 404) {
-						break;
+					if (result.response?.ok && result.error) {
+						// The status line arrived but the answer did not: a streamed
+						// reply can still fail after its 200 (an overloaded_error
+						// event, a cut connection), and the CLI is what saw that.
+						// Nothing proves the account healthy, so hold it off without
+						// counting a failure, as for a request that got no answer.
+						log.error(
+							`Claude Code CLI auto-refresh for ${accountRow.name} failed after a ${result.response.status}: ${result.error}`,
+						);
+						this.recordUncountedProbeFailure(accountRow.id, accountRow.name);
+						return false;
 					}
+					response = result.response;
+					if (!response) {
+						lastError = new Error(result.error ?? "no response from the proxy");
+					}
+				}
+			}
+			if (!sentViaCli) {
+				for (const model of models) {
+					try {
+						modelToTry = model; // Update the model being tried
+						log.info(
+							`Attempting auto-refresh for ${accountRow.name} with model: ${modelToTry} to endpoint: ${endpoint}`,
+						);
 
-					// If model not found (404), try next model
-					if (response.status === 404) {
+						const requestBody = {
+							model: modelToTry,
+							max_tokens: 10,
+							messages: [
+								{
+									role: "user",
+									content: claim.prompt,
+								},
+							],
+						};
+
 						log.debug(
-							`Model ${modelToTry} not found for ${accountRow.name}, trying next model`,
+							`Auto-refresh request payload: ${JSON.stringify(requestBody, null, 2)}`,
+						);
+						log.debug(
+							`Auto-refresh headers: ${JSON.stringify(Object.fromEntries(headers.entries()), null, 2)}`,
+						);
+
+						// Past this line the text may already be on the wire, so the
+						// prompt stays claimed however the request ends.
+						probeSent = true;
+						response = await fetch(endpoint, {
+							method: "POST",
+							headers,
+							body: JSON.stringify(requestBody),
+							signal: AbortSignal.timeout(30000),
+						});
+
+						log.debug(
+							`Auto-refresh response status: ${response.status} ${response.statusText}`,
+						);
+
+						// If we get a successful response, break out of the loop
+						if (response.ok || response.status !== 404) {
+							break;
+						}
+
+						// If model not found (404), try next model
+						if (response.status === 404) {
+							log.debug(
+								`Model ${modelToTry} not found for ${accountRow.name}, trying next model`,
+							);
+						}
+					} catch (fetchError) {
+						lastError = fetchError as Error;
+						log.debug(
+							`Network error with model ${modelToTry} for ${accountRow.name}:`,
+							fetchError,
 						);
 					}
-				} catch (fetchError) {
-					lastError = fetchError as Error;
-					log.debug(
-						`Network error with model ${modelToTry} for ${accountRow.name}:`,
-						fetchError,
-					);
 				}
 			}
 
