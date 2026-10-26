@@ -5,28 +5,28 @@ import type { RequestMeta } from "@better-ccflare/types";
 import { chatGptCloudflareCookieJar } from "../chatgpt-cloudflare-cookies";
 import { ERROR_MESSAGES, INTERNAL_PROBE_SECRET_HEADER } from "./proxy-types";
 
+const INTERNAL_HEADER_PREFIX = "x-better-ccflare-";
+
 /**
- * Internal proxy control headers that must NEVER be forwarded to the upstream
- * provider: they gate privileged proxy behaviour (see isInternalProbe), and a
- * provider or custom endpoint that received them — the probe secret above all —
- * could replay them with a marker to forge privileged requests.
+ * Internal proxy headers that must NEVER be forwarded to the upstream provider.
+ * Some gate privileged proxy behaviour (see isInternalProbe): a provider or
+ * custom endpoint that received them — the probe secret above all — could
+ * replay them with a marker to forge privileged requests. The rest are routing
+ * state (forced account id, session bypass) that only identifies the proxy.
+ *
+ * Stripped by prefix rather than by list: most providers override
+ * prepareHeaders() without BaseProvider's prefix sweep, so a list here is the
+ * last line of defence and silently goes stale whenever a header is added.
  */
 function stripInternalControlHeaders(headers: Headers): void {
+	// Spread first: deleting while iterating a live Headers skips entries.
+	for (const key of [...headers.keys()]) {
+		if (key.startsWith(INTERNAL_HEADER_PREFIX)) {
+			headers.delete(key);
+		}
+	}
+	// Covered by the prefix today; kept explicit so a rename can't reopen #336.
 	headers.delete(INTERNAL_PROBE_SECRET_HEADER);
-	headers.delete("x-better-ccflare-auto-refresh");
-	headers.delete("x-better-ccflare-keepalive");
-	headers.delete("x-better-ccflare-request-id");
-	headers.delete("x-better-ccflare-request-stream");
-	headers.delete("x-better-ccflare-codex-custom-tools");
-	headers.delete("x-better-ccflare-native-responses");
-	headers.delete("x-better-ccflare-authenticated-caller");
-	headers.delete("x-better-ccflare-exclude-providers");
-	headers.delete("x-better-ccflare-codex-continuation");
-	headers.delete("x-better-ccflare-prompt-cache-mode");
-	headers.delete("x-better-ccflare-prompt-cache-ttl");
-	headers.delete("x-better-ccflare-prompt-cache-breakpoint");
-	headers.delete("x-better-ccflare-codex-path");
-	headers.delete("x-better-ccflare-codex-transport");
 }
 
 /**

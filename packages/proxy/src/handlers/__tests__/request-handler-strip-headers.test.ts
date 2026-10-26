@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { AnthropicProvider } from "@better-ccflare/providers";
 import { makeProxyRequest } from "../request-handler";
 
 /**
@@ -123,5 +124,69 @@ describe("makeProxyRequest strips internal control headers before provider forwa
 			expect(sentHeaders?.get(header)).toBeNull();
 		}
 		expect(sentHeaders?.get("authorization")).toBe("Bearer token");
+	});
+
+	// The schedulers' routing headers (forced account, session bypass) were
+	// never on the strip list, and most providers override prepareHeaders()
+	// without BaseProvider's prefix sweep, so they reached the provider.
+	const routingAndFutureHeaders = {
+		"x-better-ccflare-account-id": "00000000-0000-0000-0000-000000000001",
+		"x-better-ccflare-bypass-session": "true",
+		"x-better-ccflare-some-future-header": "1",
+	};
+
+	it("does not forward routing or unlisted internal headers on the headers-param path", async () => {
+		await makeProxyRequest(
+			"https://api.anthropic.com/v1/messages",
+			"POST",
+			new Headers({ ...routingAndFutureHeaders, "x-api-key": "k" }),
+			undefined,
+			false,
+		);
+		for (const header of Object.keys(routingAndFutureHeaders)) {
+			expect(sentHeaders?.get(header)).toBeNull();
+		}
+		expect(sentHeaders?.get("x-api-key")).toBe("k");
+	});
+
+	it("does not forward routing or unlisted internal headers on the Request-target path", async () => {
+		await makeProxyRequest(
+			new Request("https://api.anthropic.com/v1/messages", {
+				method: "POST",
+				headers: { ...routingAndFutureHeaders, "x-api-key": "k" },
+			}),
+		);
+		for (const header of Object.keys(routingAndFutureHeaders)) {
+			expect(sentHeaders?.get(header)).toBeNull();
+		}
+		expect(sentHeaders?.get("x-api-key")).toBe("k");
+	});
+
+	it("sends no internal header to Anthropic for an auto-refresh probe", async () => {
+		// The header set AutoRefreshScheduler attaches, through the Anthropic
+		// provider's own prepareHeaders() as proxyWithAccount does.
+		const probeHeaders = new Headers({
+			"anthropic-version": "2023-06-01",
+			"x-better-ccflare-account-id": "00000000-0000-0000-0000-000000000001",
+			"x-better-ccflare-bypass-session": "true",
+			"x-better-ccflare-auto-refresh": "true",
+			"x-better-ccflare-internal-probe-secret": "s3cr3t",
+		});
+		const outgoing = new AnthropicProvider().prepareHeaders(
+			probeHeaders,
+			"access-token",
+		);
+		await makeProxyRequest(
+			"https://api.anthropic.com/v1/messages",
+			"POST",
+			outgoing,
+			undefined,
+			false,
+		);
+		const leaked = [...(sentHeaders?.keys() ?? [])].filter((key) =>
+			key.startsWith("x-better-ccflare-"),
+		);
+		expect(leaked).toEqual([]);
+		expect(sentHeaders?.get("authorization")).toBe("Bearer access-token");
 	});
 });
