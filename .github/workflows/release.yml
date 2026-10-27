@@ -73,6 +73,13 @@ jobs:
       - name: Build non-Windows architectures
         run: |
           cd apps/cli
+          # A fork's builds name themselves after their tag, so a binary from
+          # v3.5.105-downstream.1 reports 3.5.105+downstream.1, not upstream's
+          # 3.5.105.
+          REF_NAME="${{ github.ref_name }}"
+          if [[ "$REF_NAME" == *-downstream* ]]; then
+            export CCFLARE_BUILD_SUFFIX="${REF_NAME#*-}"
+          fi
           CCFLARE_SKIP_PLATFORMS=bun-windows-x64 bun run build:multi
 
       - name: Verify binaries
